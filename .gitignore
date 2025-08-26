@@ -1,0 +1,10 @@
+# Ignore personal JSON files
+OpenAPIScripMaster.json
+
+# Ignore Python cache
+__pycache__/
+*.pyc
+
+# Ignore logs and envs
+*.log
+*.env
