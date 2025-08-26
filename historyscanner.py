@@ -1,110 +1,135 @@
-import pandas as pd
+import os
+import json
 import requests
-import datetime, os, json, sys
+import pandas as pd
+import datetime
 from dotenv import load_dotenv
+#import pyotp
 
-# 🔹 Load credentials from config.env
+# Load API keys and credentials from config.env
 load_dotenv("config.env")
-API_KEY   = os.getenv("API_KEY")
+
+API_KEY = os.getenv("API_KEY")
 CLIENT_ID = os.getenv("CLIENT_ID")
-PASSWORD  = os.getenv("PASSWORD")
+PASSWORD = os.getenv("PASSWORD")
+TOTP_SECRET = os.getenv("TOTP")  # base32 secret for 2FA
 
-# 🔹 Setup AngelOne connection
-obj = SmartConnect(api_key=API_KEY)
-obj.generateSession(CLIENT_ID, PASSWORD)
+LOGIN_URL = "https://apiconnect.angelone.in/rest/auth/angelbroking/user/v1/loginByPassword"
+HIST_URL = "https://apiconnect.angelone.in/rest/secure/angelbroking/historical/v1/getCandleData"
 
-# -------------------
-# Load tokens from OpenAPIScripMaster.json
-# -------------------
-def load_tokens():
-    with open("OpenAPIScripMaster.json","r") as f:
-        df = pd.DataFrame(json.load(f))
+# ---------------- LOGIN ----------------
+def angel_login():
+    otp = pyotp.TOTP(TOTP_SECRET).now()
 
-    # Handle column names (exchange vs exch_seg)
-    col_exchange = "exchange" if "exchange" in df.columns else "exch_seg"
-
-    # NSE EQ filter only
-    df = df[df[col_exchange]=="NSE"]
-
-    return dict(zip(df["symbol"], df["token"]))
-
-# -------------------
-# Fetch Historical Candles
-# -------------------
-def get_history(symboltoken, date, exchange="NSE", interval="5minute"):
-    start = f"{date} 09:15"
-    end   = f"{date} 15:30"
-
-    params = {
-        "exchange": exchange,
-        "symboltoken": str(symboltoken),
-        "interval": interval,
-        "fromdate": start,
-        "todate": end
+    payload = {
+        "clientcode": CLIENT_ID,
+        "password": PASSWORD,
+        "totp": otp
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "X-PrivateKey": API_KEY
     }
 
-    res = obj.getCandleData(params)
-    if "data" not in res:
-        print(f"⚠️ No data for token {symboltoken}")
-        return pd.DataFrame()
+    r = requests.post(LOGIN_URL, json=payload, headers=headers)
+    data = r.json()
 
-    df = pd.DataFrame(res["data"], columns=["time","open","high","low","close","volume"])
-    df["time"] = pd.to_datetime(df["time"])
-    return df
+    if not data.get("status"):
+        raise Exception("Login failed: " + str(data))
 
-# -------------------
-# Strategy Condition: Volume Spike & Price above VWAP
-# -------------------
-def check_conditions(df):
-    if df.empty:
-        return []
+    jwt_token = data["data"]["jwtToken"]
+    return jwt_token
 
-    # VWAP calculation
-    df["cum_pv"] = (df["close"]*df["volume"]).cumsum()
-    df["cum_vol"] = df["volume"].cumsum()
-    df["vwap"] = df["cum_pv"] / df["cum_vol"]
+# ---------------- HISTORY API ----------------
+def get_history(jwt_token, symboltoken, interval, from_date, to_date):
+    headers = {
+        "Authorization": f"Bearer {jwt_token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "X-ClientLocalIP": "127.0.0.1",
+        "X-ClientPublicIP": "127.0.0.1",
+        "X-MACAddress": "XX:XX:XX:XX:XX:XX",
+        "X-PrivateKey": API_KEY,
+    }
+    payload = {
+        "exchange": "NSE",
+        "symboltoken": symboltoken,
+        "interval": interval,
+        "fromdate": from_date,
+        "todate": to_date,
+    }
+    r = requests.post(HIST_URL, headers=headers, json=payload)
+    data = r.json()
+    return data.get("data", [])
 
-    # Rolling average of last 30 candles
-    df["avg_vol30"] = df["volume"].rolling(30).mean()
-
-    signals = []
-    for i, row in df.iterrows():
-        if row["avg_vol30"] > 0:  # avoid NaN early candles
-            if row["volume"] >= 3 * row["avg_vol30"] and row["close"] > row["vwap"]:
-                signals.append((row["time"], row["close"], row["volume"]))
-    return signals
-
-# -------------------
-# Main
-# -------------------
-def main():
-    # Take date from CLI args
-    if len(sys.argv) < 2:
-        print("Usage: python historyscanner.py YYYY-MM-DD")
-        sys.exit(1)
-
-    date = sys.argv[1]
-
-    tokens = load_tokens()
-
-    # Read watchlist
+# ---------------- UTILITIES ----------------
+def load_watchlist():
     with open("watchlist.txt") as f:
-        watchlist = [line.strip() for line in f if line.strip()]
+        return [line.strip() for line in f if line.strip()]
 
-    for stock in watchlist:
-        if stock not in tokens:
-            print(f"⚠️ {stock} not found in token map, skipping...")
+def calculate_vwap(df):
+    q = df["volume"]
+    p = (df["high"] + df["low"] + df["close"]) / 3
+    return (p * q).cumsum() / q.cumsum()
+
+# ---------------- SCANNER LOGIC ----------------
+def scan_history(date):
+    with open("OpenAPIScripMaster.json", "r") as f:
+        scrip_master = json.load(f)
+    df = pd.DataFrame(scrip_master)
+
+    jwt_token = angel_login()
+    watchlist = load_watchlist()
+    results = {}
+
+    from_date = f"{date} 09:15"
+    to_date   = f"{date} 15:30"
+
+    for symbol in watchlist:
+        row = df[df["symbol"] == symbol]
+        if row.empty:
             continue
 
-        df = get_history(tokens[stock], date=date)
-        signals = check_conditions(df)
+        token = str(row.iloc[0]["token"])
 
-        if signals:
-            print(f"\n🚨 {stock} Signals on {date}:")
-            for sig in signals:
-                print(f"  Time={sig[0]}, Price={sig[1]}, Volume={sig[2]}")
-        else:
-            print(f"{stock}: No signal found on {date}.")
+        candles = get_history(jwt_token, token, "FIVE_MINUTE", from_date, to_date)
+        if not candles:
+            continue
 
+        hist = pd.DataFrame(candles, columns=["time", "open", "high", "low", "close", "volume"])
+        hist["time"] = pd.to_datetime(hist["time"])
+        hist[["open","high","low","close","volume"]] = hist[["open","high","low","close","volume"]].astype(float)
+
+        # VWAP
+        hist["vwap"] = calculate_vwap(hist)
+
+        # Volume condition
+        if len(hist) >= 31:
+            last_vol = hist.iloc[-1]["volume"]
+            avg_vol = hist.iloc[-31:-1]["volume"].mean()
+            last_close = hist.iloc[-1]["close"]
+            last_vwap = hist.iloc[-1]["vwap"]
+
+            if last_vol > 3 * avg_vol and last_close > last_vwap:
+                results[symbol] = {
+                    "last_close": round(last_close,2),
+                    "last_vol": int(last_vol),
+                    "avg_vol": int(avg_vol),
+                    "last_vwap": round(last_vwap,2),
+                }
+
+    return results
+
+# ---------------- MAIN ----------------
 if __name__ == "__main__":
-    main()
+    import sys
+    if len(sys.argv) < 2:
+        print("Usage: python historyscanner.py YYYY-MM-DD")
+        exit(1)
+
+    date = sys.argv[1]
+    print(f"[History Scanner] Checking {date}...")
+
+    alerts = scan_history(date)
+    print("Alerts:", json.dumps(alerts, indent=2))
