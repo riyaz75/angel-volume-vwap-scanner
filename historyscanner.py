@@ -2,9 +2,7 @@ import os
 import json
 import requests
 import pandas as pd
-import datetime
 from dotenv import load_dotenv
-#import pyotp
 
 # Load API keys and credentials from config.env
 load_dotenv("config.env")
@@ -12,34 +10,28 @@ load_dotenv("config.env")
 API_KEY = os.getenv("API_KEY")
 CLIENT_ID = os.getenv("CLIENT_ID")
 PASSWORD = os.getenv("PASSWORD")
-TOTP_SECRET = os.getenv("TOTP")  # base32 secret for 2FA
 
 LOGIN_URL = "https://apiconnect.angelone.in/rest/auth/angelbroking/user/v1/loginByPassword"
 HIST_URL = "https://apiconnect.angelone.in/rest/secure/angelbroking/historical/v1/getCandleData"
 
-# ---------------- LOGIN ----------------
+# ---------------- LOGIN (same as scanner.py) ----------------
 def angel_login():
-    otp = pyotp.TOTP(TOTP_SECRET).now()
-
     payload = {
         "clientcode": CLIENT_ID,
-        "password": PASSWORD,
-        "totp": otp
+        "password": PASSWORD
     }
     headers = {
         "Content-Type": "application/json",
         "Accept": "application/json",
         "X-PrivateKey": API_KEY
     }
-
     r = requests.post(LOGIN_URL, json=payload, headers=headers)
     data = r.json()
 
     if not data.get("status"):
         raise Exception("Login failed: " + str(data))
 
-    jwt_token = data["data"]["jwtToken"]
-    return jwt_token
+    return data["data"]["jwtToken"]
 
 # ---------------- HISTORY API ----------------
 def get_history(jwt_token, symboltoken, interval, from_date, to_date):
@@ -104,7 +96,7 @@ def scan_history(date):
         # VWAP
         hist["vwap"] = calculate_vwap(hist)
 
-        # Volume condition
+        # Volume + VWAP condition
         if len(hist) >= 31:
             last_vol = hist.iloc[-1]["volume"]
             avg_vol = hist.iloc[-31:-1]["volume"].mean()
