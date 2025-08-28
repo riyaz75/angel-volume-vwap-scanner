@@ -48,12 +48,25 @@ def load_tokens():
     #watch = df[(df["exchange"]==EXCHANGE) & (df["symbol"].isin(symbols))]
     return dict(zip(watch["symbol"], watch["token"]))
 
-def get_5min_data(symbol, token):
-    """
-    Placeholder: Here you should call Angel One SmartAPI candle endpoint
-    using requests with your token/session.
-    For now, this just returns dummy dataframe.
-    """
+def get_5min_data(symbol, token, jwt_token):
+    url = "https://apiconnect.angelbroking.com/rest/secure/angelbroking/market/v1/history"
+    headers = {
+        "X-PrivateKey": os.getenv("ANGEL_API_KEY"),
+        "Authorization": f"Bearer {jwt_token}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "exchange": "NSE",
+        "symboltoken": token,
+        "interval": "FIVE_MINUTE",
+        "fromdate": (datetime.now() - pd.Timedelta(minutes=5*30)).strftime("%Y-%m-%d %H:%M"),
+        "todate": datetime.now().strftime("%Y-%m-%d %H:%M")
+    }
+    resp = requests.post(url, json=payload, headers=headers).json()
+    candles = resp.get("data", {}).get("candles", [])
+    df = pd.DataFrame(candles, columns=["datetime","open","high","low","close","volume"])
+    return df
+
     # Example DataFrame with OHLCV + datetime
     now = datetime.now()
     df = pd.DataFrame({
@@ -72,7 +85,6 @@ def check_signal(df):
     if last["volume"] >= VOL_MULT * avg_vol and last["close"] > vwap:
         return True, last["close"], last["volume"], avg_vol, vwap
     return False, last["close"], last["volume"], avg_vol, vwap
-
 
 
 # ---- Main ----
